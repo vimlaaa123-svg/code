@@ -19,9 +19,14 @@ import string
 import time
 import os
 import sys
+import json
+import hmac
+import hashlib
+import secrets
 import psutil
 from datetime import datetime, timedelta
 from typing import Union, Dict, Any, List, Optional, Tuple
+from urllib.parse import urlencode
 
 # --- HIGH PERFORMANCE MODULES ---
 try:
@@ -31,6 +36,7 @@ except ImportError:
     pass
 
 import aiosqlite
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, IS_NOT_MEMBER
@@ -44,7 +50,8 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     FSInputFile,
-    Message
+    Message,
+    WebAppInfo
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
@@ -64,6 +71,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "production_core_bb.db")
 PROOF_FOLDER = os.path.join(BASE_DIR, "payment_proofs")
 TEMP_FOLDER = os.path.join(BASE_DIR, "temp_downloads")
+WEB_VERIFY_HOST = os.getenv("WEB_VERIFY_HOST", "0.0.0.0")
+WEB_VERIFY_PORT = int(os.getenv("WEB_VERIFY_PORT", "8080"))
+WEB_VERIFY_BASE_URL = os.getenv("WEB_VERIFY_BASE_URL", f"http://127.0.0.1:{WEB_VERIFY_PORT}")
+WEB_VERIFY_SECRET = os.getenv("WEB_VERIFY_SECRET", API_TOKEN)
 
 # INITIALIZATION OF DIRECTORIES
 for folder in [PROOF_FOLDER, TEMP_FOLDER]:
@@ -82,6 +93,7 @@ DB_CONN: Optional[aiosqlite.Connection] = None
 CONFIG_CACHE: Dict[str, str] = {}
 CHANNEL_CACHE: List[Dict[str, str]] = []
 ADMIN_CACHE: List[int] = []
+BOT_USERNAME: str = ""
 
 class SystemStates(StatesGroup):
     """Finite State Machine definitions for bot flows."""
@@ -160,7 +172,20 @@ async def initialize_database() -> None:
             is_banned INTEGER DEFAULT 0,
             last_msg_id INTEGER,
             is_verified INTEGER DEFAULT 0,
-            reward_claimed INTEGER DEFAULT 0
+            reward_claimed INTEGER DEFAULT 0,
+            verification_status TEXT DEFAULT 'pending'
+        )
+    """)
+
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS device_verifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            ad_id TEXT NOT NULL,
+            ip_address TEXT NOT NULL,
+            user_agent TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )
     """)
 
@@ -169,6 +194,13 @@ async def initialize_database() -> None:
         await db.execute("ALTER TABLE users ADD COLUMN reward_claimed INTEGER DEFAULT 0")
     except Exception:
         pass # Column already exists
+
+    try:
+        await db.execute("ALTER TABLE users ADD COLUMN verification_status TEXT DEFAULT 'pending'")
+    except Exception:
+        pass # Column already exists
+
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_device_verifications_ad_ip ON device_verifications(ad_id, ip_address)")
 
     # Inventory Table (Stock V2)
     await db.execute("""
@@ -343,6 +375,311 @@ def generate_security_captcha(length: int = 7) -> str:
     characters = string.ascii_uppercase + string.digits
     return ''.join(random.choices(characters, k=length))
 
+def create_verification_token(user_id: int, ttl_seconds: int = 1800) -> str:
+    """Creates a signed short-lived token for the web verification endpoint."""
+    payload = {
+        "uid": user_id,
+        "exp": int(time.time()) + ttl_seconds,
+        "nonce": secrets.token_hex(8),
+    }
+    payload_raw = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    signature = hmac.new(WEB_VERIFY_SECRET.encode(), payload_raw.encode(), hashlib.sha256).hexdigest()
+    return f"{payload_raw}.{signature}"
+
+
+def parse_verification_token(token: str) -> Optional[Dict[str, Any]]:
+    """Validates and decodes a signed token from the verification webapp."""
+    if not token or "." not in token:
+        return None
+
+    payload_raw, signature = token.rsplit(".", 1)
+    expected = hmac.new(WEB_VERIFY_SECRET.encode(), payload_raw.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None
+
+    try:
+        payload = json.loads(payload_raw)
+    except json.JSONDecodeError:
+        return None
+
+    if int(payload.get("exp", 0)) < int(time.time()):
+        return None
+
+    return payload
+
+
+def build_verification_url(user_id: int) -> str:
+    """Builds a signed mini-web URL for device verification."""
+    token = create_verification_token(user_id)
+    return f"{WEB_VERIFY_BASE_URL}/verify?{urlencode({'token': token})}"
+
+
+def render_verify_page(title: str, body: str, token: str = "", allow_submit: bool = True, return_url: str = "") -> str:
+    button_html = ""
+    script_html = ""
+    if allow_submit and token:
+        button_html = f"""
+            <form id=\"verifyForm\" method=\"post\" action=\"/verify/submit\">
+              <input type=\"hidden\" name=\"token\" value=\"{token}\">
+              <input id=\"ad_id\" name=\"ad_id\" type=\"hidden\" value=\"\">
+              <input id=\"device_fingerprint\" name=\"device_fingerprint\" type=\"hidden\" value=\"\">
+              <button id=\"verifyBtn\" type=\"submit\">Verify Device</button>
+            </form>
+        """
+        script_html = """
+<script>
+(function() {
+  const form = document.getElementById('verifyForm');
+  const adIdField = document.getElementById('ad_id');
+  const fpField = document.getElementById('device_fingerprint');
+
+  function tryGetAdId() {
+    const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+    const initData = tg && tg.initDataUnsafe ? tg.initDataUnsafe : {};
+    const fromInit = initData.ad_id || initData.device_id || initData.query_id || '';
+    const fromQuery = new URLSearchParams(window.location.search).get('ad_id') || '';
+    const fromStorage = localStorage.getItem('ad_id') || '';
+    return (fromInit || fromQuery || fromStorage || '').toString().trim();
+  }
+
+  function buildFingerprint() {
+    const nav = navigator || {};
+    const scr = window.screen || {};
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'na';
+    const parts = [
+      nav.userAgent || 'na',
+      nav.platform || 'na',
+      nav.language || 'na',
+      `${scr.width || 0}x${scr.height || 0}`,
+      tz,
+      String(nav.hardwareConcurrency || 0),
+      String(nav.deviceMemory || 0)
+    ];
+    return btoa(unescape(encodeURIComponent(parts.join('|')))).slice(0, 240);
+  }
+
+  adIdField.value = tryGetAdId();
+  fpField.value = buildFingerprint();
+
+  if (form) {
+    form.addEventListener('submit', function() {
+      const btn = document.getElementById('verifyBtn');
+      if (btn) {
+        btn.textContent = 'Verifying...';
+        btn.disabled = true;
+      }
+    });
+  }
+})();
+</script>
+        """
+    elif return_url:
+        button_html = f'<a class="btn" href="{return_url}">Return to Bot</a>'
+
+    return f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Device Verification</title>
+  <style>
+    :root {{
+      --bg1:#3b0764;
+      --bg2:#6d28d9;
+      --bg3:#ec4899;
+      --card:#1f1147cc;
+      --txt:#ffffff;
+      --muted:#e9d5ff;
+      --ok:#22c55e;
+      --ok2:#86efac;
+    }}
+    * {{ -webkit-tap-highlight-color: transparent; box-sizing: border-box; }}
+    body {{
+      font-family: 'Segoe UI', Arial, sans-serif;
+      color:var(--txt);
+      margin:0;
+      min-height:100vh;
+      overflow:hidden;
+      background: linear-gradient(135deg, var(--bg1), var(--bg2), var(--bg3));
+      background-size: 240% 240%;
+      animation: gradientShift 10s ease infinite;
+    }}
+    @keyframes gradientShift {{ 0%{{background-position:0% 50%}} 50%{{background-position:100% 50%}} 100%{{background-position:0% 50%}} }}
+    .rain {{ position:fixed; inset:0; pointer-events:none; overflow:hidden; }}
+    .drop {{ position:absolute; top:-20px; width:2px; height:18px; background:linear-gradient(transparent,#f5d0fe); opacity:.6; animation: fall linear infinite; }}
+    @keyframes fall {{ to {{ transform: translateY(110vh); }} }}
+    .wrap {{
+      position:relative;
+      max-width:430px;
+      margin:8vh auto;
+      padding:26px;
+      background:var(--card);
+      border:1px solid #ffffff30;
+      border-radius:18px;
+      backdrop-filter: blur(10px);
+      box-shadow:0 18px 45px #00000040;
+      z-index:1;
+    }}
+    .loader {{ width:38px; height:38px; border:4px solid #ffffff30; border-top-color:#ffffff; border-radius:50%; animation:spin 1s linear infinite; margin: 0 auto 16px; }}
+    @keyframes spin {{to{{transform:rotate(360deg)}}}}
+    h2 {{ margin:6px 0 10px; text-align:center; }}
+    p {{ color:var(--muted); text-align:center; line-height:1.45; }}
+    form {{ margin-top:16px; }}
+    button,.btn {{
+      display:inline-block; text-align:center; padding:12px 14px; border:none; border-radius:12px;
+      background:linear-gradient(90deg, var(--ok), var(--ok2)); color:#06210f; font-weight:700; cursor:pointer;
+      text-decoration:none; margin-top:14px; width:100%; transition: transform .15s ease, filter .2s ease;
+    }}
+    button:active,.btn:active {{ transform: scale(0.97); filter: brightness(1.08); }}
+  </style>
+</head>
+<body>
+  <div class="rain" id="rain"></div>
+  <div class="wrap">
+    <div class="loader"></div>
+    <h2>{title}</h2>
+    <p>{body}</p>
+    {button_html}
+  </div>
+  <script>
+    (function makeRain() {{
+      const rain = document.getElementById('rain');
+      if (!rain) return;
+      for (let i = 0; i < 70; i++) {{
+        const d = document.createElement('span');
+        d.className = 'drop';
+        d.style.left = Math.random() * 100 + 'vw';
+        d.style.animationDuration = (0.8 + Math.random() * 1.2) + 's';
+        d.style.animationDelay = (Math.random() * 2) + 's';
+        rain.appendChild(d);
+      }}
+    }})();
+  </script>
+  {script_html}
+</body>
+</html>
+"""
+
+async def web_verify_page(request: web.Request) -> web.Response:
+    """Renders the mini verification page with loader + verify button."""
+    token = request.query.get("token", "")
+    payload = parse_verification_token(token)
+    if not payload:
+        html = render_verify_page(
+            "Session Expired",
+            "Verification link is invalid or expired. Return to the bot and run /start again.",
+            allow_submit=False,
+            return_url=f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "",
+        )
+        return web.Response(text=html, content_type="text/html")
+
+    html = render_verify_page(
+        "Click On Device Verify Button",
+        "Secure loading finished. Click verify to continue.",
+        token=token,
+        allow_submit=True,
+    )
+    return web.Response(text=html, content_type="text/html")
+
+
+async def web_verify_submit(request: web.Request) -> web.Response:
+    """Processes ad-id/IP checks with ad-id optional and IP mandatory."""
+    form = await request.post()
+    token = form.get("token", "")
+    payload = parse_verification_token(token)
+
+    if not payload:
+        html = render_verify_page(
+            "Verification Failed",
+            "Missing or invalid verification data. Return to bot and try again.",
+            allow_submit=False,
+            return_url=f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "",
+        )
+        return web.Response(text=html, content_type="text/html")
+
+    user_id = int(payload["uid"])
+    raw_ip = request.headers.get("X-Forwarded-For", request.remote or "")
+    ip_address = raw_ip.split(",")[0].strip() if raw_ip else ""
+
+    if not ip_address:
+        html = render_verify_page(
+            "Verify Failed",
+            "Unable to detect your IP/network. Verification failed. Please retry from a stable network.",
+            allow_submit=False,
+            return_url=f"https://t.me/{BOT_USERNAME}?start={user_id}" if BOT_USERNAME else "",
+        )
+        return web.Response(text=html, content_type="text/html")
+
+    ad_id = str(form.get("ad_id", "")).strip()
+    fingerprint = str(form.get("device_fingerprint", "")).strip()[:240]
+    user_agent = request.headers.get("User-Agent", "")[:512]
+
+    # If ad-id is missing, skip duplicate ad-id+ip check as requested.
+    duplicate = None
+    if ad_id:
+        duplicate = await execute_query(
+            "SELECT id FROM device_verifications WHERE ad_id = ? AND ip_address = ? LIMIT 1",
+            (ad_id, ip_address),
+            fetchone=True,
+        )
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return_url = f"https://t.me/{BOT_USERNAME}?start={user_id}" if BOT_USERNAME else ""
+    stored_ad_id = ad_id if ad_id else ""
+    stored_ua = f"{user_agent} | fp:{fingerprint}"[:512]
+
+    if duplicate:
+        await execute_query(
+            "INSERT INTO device_verifications (user_id, ad_id, ip_address, user_agent, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, stored_ad_id, ip_address, stored_ua, "duplicate", now),
+        )
+        await execute_query(
+            "UPDATE users SET verification_status = ?, reward_claimed = 1 WHERE user_id = ?",
+            ("duplicate", user_id),
+        )
+        html = render_verify_page(
+            "Duplicate Device",
+            "This ad-id and IP already verified before. You are not going to get referral points.",
+            allow_submit=False,
+            return_url=return_url,
+        )
+        return web.Response(text=html, content_type="text/html")
+
+    status = "approved_no_adid" if not ad_id else "approved"
+    await execute_query(
+        "INSERT INTO device_verifications (user_id, ad_id, ip_address, user_agent, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, stored_ad_id, ip_address, stored_ua, status, now),
+    )
+    await execute_query(
+        "UPDATE users SET verification_status = ?, is_verified = 1, reward_claimed = 0 WHERE user_id = ?",
+        ("approved", user_id),
+    )
+
+    html = render_verify_page(
+        "Verification Success",
+        "Device verification complete. Redirect to bot and continue.",
+        allow_submit=False,
+        return_url=return_url,
+    )
+    return web.Response(text=html, content_type="text/html")
+
+
+async def start_verification_webserver() -> web.AppRunner:
+    """Starts the mini web verification server alongside the bot."""
+    app = web.Application()
+    app.add_routes([
+        web.get("/verify", web_verify_page),
+        web.post("/verify/submit", web_verify_submit),
+    ])
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, WEB_VERIFY_HOST, WEB_VERIFY_PORT)
+    await site.start()
+    logger.info(f"Verification web server listening on {WEB_VERIFY_HOST}:{WEB_VERIFY_PORT}")
+    return runner
+
 async def clear_previous_interface(user_id: int) -> None:
     """Deletes the previous bot interface message to keep chat clean."""
     res = await execute_query("SELECT last_msg_id FROM users WHERE user_id = ?", (user_id,), fetchone=True)
@@ -466,16 +803,17 @@ def build_admin_dashboard() -> InlineKeyboardMarkup:
 # ==========================================
 @dp.message(CommandStart())
 async def command_start_handler(message: types.Message, command: CommandObject, state: FSMContext):
-    """Entry point for users. Mandates captcha and profile check on EVERY /start execution."""
+    """Entry point for users. Captcha then web device verification on every /start."""
     await state.clear()
     user_id = message.from_user.id
     username = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
 
-    # Initialize or update user in DB
+    # Initialize user in DB while preserving old records
     await execute_query("""
-        INSERT OR IGNORE INTO users (user_id, username, points, join_date, is_verified, ref_by) 
-        VALUES (?, ?, 0, ?, 0, NULL)
+        INSERT OR IGNORE INTO users (user_id, username, points, join_date, is_verified, ref_by, verification_status)
+        VALUES (?, ?, 0, ?, 0, NULL, 'pending')
     """, (user_id, username, time.strftime("%Y-%m-%d")))
+    await execute_query("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
 
     user_data = await execute_query("SELECT is_banned, ref_by FROM users WHERE user_id = ?", (user_id,), fetchone=True)
 
@@ -516,55 +854,44 @@ async def initiate_captcha_protocol(message: types.Message, state: FSMContext):
 
 @dp.message(SystemStates.captcha_verification)
 async def process_captcha_input(message: types.Message, state: FSMContext):
-    """Validates captcha and user profile completeness (username/photo)."""
+    """Validates captcha then routes user to verification or dashboard terms."""
     data = await state.get_data()
     user_input = message.text.strip().upper() if message.text else ""
     user_id = message.from_user.id
 
-    # 1. Validation: Captcha Match
     if user_input != data.get('captcha_ans'):
         await state.update_data(captcha_ans=generate_security_captcha())
         new_code = (await state.get_data()).get('captcha_ans')
         text = f"❌ <b>AUTHORIZATION FAILED</b>\nIncorrect sequence. Input the new code:\n\n🔑 <code>{new_code}</code>"
         return await send_smart_interface(user_id, text)
 
-    # 2. Validation: Username Existence
-    if not message.from_user.username:
+    verification = await execute_query(
+        "SELECT verification_status FROM users WHERE user_id = ?",
+        (user_id,),
+        fetchone=True,
+    )
+    verification_status = verification.get("verification_status") if verification else "pending"
+
+    if verification_status not in {"approved", "duplicate"}:
+        verify_url = build_verification_url(user_id)
+        markup = InlineKeyboardBuilder()
+        markup.row(InlineKeyboardButton(text="🌐 Open Device Verify", web_app=WebAppInfo(url=verify_url)))
+
         text = (
-            "❌ <b>PROFILE INCOMPLETE</b>\n"
+            "✅ <b>Captcha Passed</b>\n"
             f"{create_divider()}\n"
-            "System requires a standard Telegram Username (@username) for ledger tracking.\n\n"
-            "<i>Action Required: Access Telegram Settings > Set Username > Transmit /start again.</i>"
+            "Now complete mini web verification.\n"
+            "Open the page, wait for loading, then click <b>Verify Device</b>."
         )
-        return await send_smart_interface(user_id, text)
+        await send_smart_interface(user_id, text, markup.as_markup())
+        await state.clear()
+        return
 
-    # 3. Validation: Profile Photo
-    try:
-        user_photos = await bot.get_user_profile_photos(user_id)
-        if user_photos.total_count == 0:
-            text = (
-                "❌ <b>PROFILE INCOMPLETE</b>\n"
-                f"{create_divider()}\n"
-                "System requires a Profile Image to prevent automated bot access.\n\n"
-                "<i>Action Required: Upload an avatar in Telegram Settings > Transmit /start again.</i>"
-            )
-            return await send_smart_interface(user_id, text)
-    except Exception as e:
-        logger.error(f"Failed to fetch profile photos for {user_id}: {e}")
-
-    # --- SUCCESSFUL VERIFICATION FLOW ---
-    
-    # 4. Mark First-Time Verification (No Rewards Yet - Rewards happen after channel join)
-    user_data = await execute_query("SELECT is_verified FROM users WHERE user_id=?", (user_id,), fetchone=True)
-    
-    if user_data['is_verified'] == 0:
-        await execute_query("UPDATE users SET is_verified=1 WHERE user_id=?", (user_id,))
-
-    # Clear state and show Terms of Service directly
+    # Existing verified flow remains available for all bot features.
     await state.clear()
     await send_smart_interface(user_id, "✅ <b>Verification Complete. Establishing secure connection...</b>")
     await asyncio.sleep(1.5)
-    
+
     text = (
         f"🛒 <b>BIG BASKET DISTRIBUTION SYSTEM</b>\n"
         f"{create_divider()}\n"
@@ -585,11 +912,26 @@ async def process_captcha_input(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "accept_terms")
 @dp.callback_query(F.data == "return_to_main")
 async def process_dashboard_entry(callback: CallbackQuery, state: FSMContext):
-    """Evaluates channel subs before allowing dashboard access."""
+    """Evaluates verification and channel subs before allowing dashboard access."""
     await state.clear()
     user_id = callback.from_user.id
+
+    verification = await execute_query(
+        "SELECT verification_status FROM users WHERE user_id = ?",
+        (user_id,),
+        fetchone=True,
+    )
+    if not verification or verification.get("verification_status") not in {"approved", "duplicate"}:
+        verify_url = build_verification_url(user_id)
+        markup = InlineKeyboardBuilder()
+        markup.row(InlineKeyboardButton(text="🌐 Open Device Verify", web_app=WebAppInfo(url=verify_url)))
+        text = "⚠️ <b>Device verification required</b>\nComplete mini web verify first to continue."
+        await send_smart_interface(user_id, text, markup.as_markup())
+        await callback.answer("Complete web verification first.", show_alert=True)
+        return
+
     missing_channels = await evaluate_channel_subscriptions(user_id)
-    
+
     if missing_channels:
         await clear_previous_interface(user_id)
         text = "🚫 <b>AUTHORIZATION REQUIRED</b>\nYou must integrate with the following network channels to proceed."
@@ -598,8 +940,8 @@ async def process_dashboard_entry(callback: CallbackQuery, state: FSMContext):
         return
 
     # --- SECURE REFERRAL REWARD LOGIC (AFTER CHANNEL VERIFICATION) ---
-    user_data = await execute_query("SELECT ref_by, reward_claimed FROM users WHERE user_id=?", (user_id,), fetchone=True)
-    if user_data and user_data['ref_by'] and user_data.get('reward_claimed', 1) == 0:
+    user_data = await execute_query("SELECT ref_by, reward_claimed, verification_status FROM users WHERE user_id=?", (user_id,), fetchone=True)
+    if user_data and user_data['verification_status'] == 'approved' and user_data['ref_by'] and user_data.get('reward_claimed', 1) == 0:
         ref_id = user_data['ref_by']
         ref_check = await execute_query("SELECT 1 FROM users WHERE user_id=?", (ref_id,), fetchone=True)
         if ref_check:
@@ -1385,16 +1727,22 @@ async def demote_admin_save(message: types.Message, state: FSMContext):
 # ==========================================
 async def core_startup():
     """Application Entry Point."""
+    global BOT_USERNAME
     logger.info("Initializing Big Basket Distribution System...")
     await initialize_database()
-    
+
     bot_info = await bot.get_me()
+    BOT_USERNAME = bot_info.username or ""
     logger.info(f"System Online: @{bot_info.username}")
-    
+
+    web_runner = await start_verification_webserver()
+
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         logger.info("Terminating System Core...")
+        if web_runner:
+            await web_runner.cleanup()
         if DB_CONN:
             await DB_CONN.close()
         await bot.session.close()
