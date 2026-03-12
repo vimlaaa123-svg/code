@@ -73,7 +73,7 @@ PROOF_FOLDER = os.path.join(BASE_DIR, "payment_proofs")
 TEMP_FOLDER = os.path.join(BASE_DIR, "temp_downloads")
 WEB_VERIFY_HOST = os.getenv("WEB_VERIFY_HOST", "0.0.0.0")
 WEB_VERIFY_PORT = int(os.getenv("WEB_VERIFY_PORT", "8080"))
-WEB_VERIFY_BASE_URL = os.getenv("WEB_VERIFY_BASE_URL", f"https://bbverify.duckdns.org")
+WEB_VERIFY_BASE_URL = os.getenv("WEB_VERIFY_BASE_URL", f"http://127.0.0.1:{WEB_VERIFY_PORT}")
 WEB_VERIFY_SECRET = os.getenv("WEB_VERIFY_SECRET", API_TOKEN)
 
 # INITIALIZATION OF DIRECTORIES
